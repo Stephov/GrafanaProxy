@@ -1,0 +1,229 @@
+@using Microsoft.AspNetCore.Components.Web
+@using Microsoft.JSInterop
+@page "/"
+@inject HttpClient Http
+@inject IJSRuntime JS
+
+<h3>Grafana proxy</h3>
+
+<a href="https://localhost:5011/grafana/" target="_blank" rel="noopener" class="btn">Open Grafana (login via GitLab)</a>
+<span>@status</span>
+
+<hr />
+
+
+<div>
+    <button class="btn" @onclick="LoadLabels">Load labels</button>
+    <span>@labelsStatus</span>
+</div>
+
+<div>
+    <button class="btn" @onclick="LoadLabels">Test Button</button>
+    <span>@testButton</span>
+</div>
+
+<div style="margin-top:10px">
+    <label>Label (e.g. project):</label>
+    <select @bind="selectedLabel">
+        <option value="">-- select label --</option>
+        @foreach (var l in labels)
+        {
+            <option value="@l">@l</option>
+        }
+    </select>
+    <button class="btn" @onclick="LoadLabelValues" disabled="@string.IsNullOrEmpty(selectedLabel)">Load values</button>
+</div>
+
+<div style="margin-top:10px">
+    <label>Value (project):</label>
+    <select @bind="selectedValue">
+        <option value="">-- select value --</option>
+        @foreach (var v in values)
+        {
+            <option value="@v">@v</option>
+        }
+    </select>
+</div>
+
+<div style="margin-top:10px">
+    <label>Start (local):</label>
+    <input type="datetime-local" @bind="startLocal" />
+    <label style="margin-left:10px">End (local):</label>
+    <Component />
+</div>
+
+<div style="margin-top:10px">
+    <label>Query (Loki):</label>
+    <input style="width:80%" @bind="queryText" />
+    <label style="margin-left:10px">Limit:</label>
+    <input type="number" min="1" max="10000" @bind="limit" style="width:80px" />
+    <label style="margin-left:10px">Export format:</label>
+    <select @bind="exportFormat">
+        <option value="json">JSON</option>
+        <option value="csv">CSV</option>
+    </select>
+</div>
+
+<div style="margin-top:10px">
+    <button class="btn" @onclick="RunSearch">Search</button>
+    <span>@searchStatus</span>
+    <button class="btn" @onclick="SaveJson" disabled="@string.IsNullOrEmpty(resultsJson)">Save JSON</button>
+    <button class="btn" @onclick="ExportResults" disabled="@string.IsNullOrEmpty(queryText)">Export</button>
+</div>
+
+<hr />
+
+<pre style="max-height:400px; overflow:auto; background:#f7f7f7; padding:10px">@resultsJson</pre>
+
+@code {
+    string status = "";
+    string labelsStatus = "";
+    string searchStatus = "";
+    string testButton = "";
+
+    List<string> labels = new();
+    List<string> values = new();
+    string labelsJson = "";
+
+    string selectedLabel = "";
+    string selectedValue = "";
+
+    DateTime startLocal = DateTime.UtcNow.AddHours(-1);
+    string startLocalString = DateTime.UtcNow.AddHours(-1).ToString("yyyy-MM-ddTHH:mm");
+    DateTime endLocal = DateTime.UtcNow;
+    string endLocalString = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm");
+
+    string queryText = "";
+    int limit = 1000;
+
+    string resultsJson = "";
+    string exportFormat = "json";
+
+    async Task LoadLabels()
+    {
+        labelsStatus = "Loading...";
+        values.Clear();
+        labels.Clear();
+        var r = await Http.GetAsync("api/labels");
+        if (r.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            labelsStatus = "No session — login via Grafana through the opened tab.";
+            return;
+        }
+        labelsJson = await r.Content.ReadAsStringAsync();
+        try
+        {
+            var arr = System.Text.Json.JsonSerializer.Deserialize<string[]>(labelsJson) ?? Array.Empty<string>();
+            labels.AddRange(arr);
+            labelsStatus = $"Loaded {labels.Count} labels";
+        }
+        catch
+        {
+            labelsStatus = "Failed to parse labels response";
+        }
+    }
+
+    async Task LoadLabelValues()
+    {
+        if (string.IsNullOrEmpty(selectedLabel)) return;
+        labelsStatus = "Loading values...";
+        values.Clear();
+        var r = await Http.GetAsync($"api/label/{Uri.EscapeDataString(selectedLabel)}/values");
+        if (r.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            labelsStatus = "No session — login via Grafana through the opened tab.";
+            return;
+        }
+        var content = await r.Content.ReadAsStringAsync();
+        try
+        {
+            var arr = System.Text.Json.JsonSerializer.Deserialize<string[]>(content) ?? Array.Empty<string>();
+            values.AddRange(arr);
+            labelsStatus = $"Loaded {values.Count} values for '{selectedLabel}'";
+        }
+        catch
+        {
+            labelsStatus = "Failed to parse label values response";
+        }
+    }
+
+    async Task RunSearch()
+    {
+        searchStatus = "Searching...";
+        resultsJson = "";
+
+        if (string.IsNullOrWhiteSpace(queryText))
+        {
+            // construct basic query using selected label/value if present
+            if (!string.IsNullOrEmpty(selectedLabel) && !string.IsNullOrEmpty(selectedValue))
+            {
+                queryText = $"{selectedLabel}=\"{selectedValue}\"";
+            }
+            else
+            {
+                searchStatus = "Empty query and no label/value selected";
+                return;
+            }
+        }
+
+        if (!TryParseLocalDateTimeToUnixMs(startLocalString, out var startMs) || !TryParseLocalDateTimeToUnixMs(endLocalString, out var endMs))
+        {
+            searchStatus = "Invalid start or end time";
+            return;
+        }
+
+        var q = System.Web.HttpUtility.UrlEncode(queryText);
+        var url = $"api/search?query={q}&start={startMs}&end={endMs}&limit={limit}";
+        var r = await Http.GetAsync(url);
+        if (r.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            searchStatus = "No session — login via Grafana through the opened tab.";
+            return;
+        }
+        resultsJson = await r.Content.ReadAsStringAsync();
+        searchStatus = "Search completed";
+    }
+
+    async Task SaveJson()
+    {
+        if (string.IsNullOrEmpty(resultsJson)) return;
+        var filename = $"loki-results-{DateTime.UtcNow:yyyyMMddHHmmss}.json";
+        await JS.InvokeVoidAsync("downloadFile", filename, resultsJson);
+    }
+
+    async Task ExportResults()
+    {
+        if (string.IsNullOrWhiteSpace(queryText)) return;
+        if (!TryParseLocalDateTimeToUnixMs(startLocalString, out var startMs) || !TryParseLocalDateTimeToUnixMs(endLocalString, out var endMs)) return;
+        var body = new
+        {
+            query = queryText,
+            start = startMs,
+            end = endMs,
+            limit = limit,
+            format = exportFormat
+        };
+        var json = System.Text.Json.JsonSerializer.Serialize(body);
+        var resp = await Http.PostAsync("api/export", new StringContent(json, System.Text.Encoding.UTF8, "application/json"));
+        if (resp.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+        {
+            searchStatus = "No session — login via Grafana through the opened tab.";
+            return;
+        }
+        var blob = await resp.Content.ReadAsByteArrayAsync();
+        var name = $"loki-export-{DateTime.UtcNow:yyyyMMddHHmmss}.{(exportFormat == "csv" ? "csv" : "json")}";
+        await JS.InvokeVoidAsync("downloadFileBytes", name, blob);
+    }
+
+    bool TryParseLocalDateTimeToUnixMs(string s, out long ms)
+    {
+        ms = 0;
+        if (string.IsNullOrEmpty(s)) return false;
+        // s expected in "yyyy-MM-ddTHH:mm"
+        if (!DateTime.TryParse(s, out var dt)) return false;
+        // assume local time
+        var utc = DateTime.SpecifyKind(dt, DateTimeKind.Local).ToUniversalTime();
+        ms = new DateTimeOffset(utc).ToUnixTimeMilliseconds();
+        return true;
+    }
+}
